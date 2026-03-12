@@ -1,0 +1,9 @@
+<Solution>
+  <Project Path="src/DirectLink.Client.Maui/DirectLink.Client.Maui.csproj">
+    <Deploy Solution="Debug|*" />
+  </Project>
+  <Project Path="src/DirectLink.Client/DirectLink.Client.csproj" />
+  <Project Path="src/DirectLink.Common/DirectLink.Common.csproj" />
+  <Project Path="src/DirectLink.Diagnostic/DirectLink.Diagnostic.csproj" />
+  <Project Path="src/DirectLink.Server/DirectLink.Server.csproj" />
+</Solution>

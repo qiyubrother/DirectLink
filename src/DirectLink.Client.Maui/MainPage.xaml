@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+             xmlns:vm="clr-namespace:DirectLink.Client.Maui.ViewModels"
+             x:Class="DirectLink.Client.Maui.MainPage"
+             x:DataType="vm:MainViewModel"
+             Title="DirectLink 点对点传文件">
+    <ScrollView>
+        <VerticalStackLayout Padding="16" Spacing="10">
+            <HorizontalStackLayout Spacing="8">
+                <Label Text="本机 ID:" VerticalOptions="Center" WidthRequest="70"/>
+                <Entry Text="{Binding ClientId}" WidthRequest="60" MaxLength="5" Keyboard="Numeric"/>
+                <Label Text="服务端:" VerticalOptions="Center" WidthRequest="50"/>
+                <Entry Text="{Binding ServerAddress}" WidthRequest="140" Placeholder="IP:50000"/>
+                <Button Text="连接" Command="{Binding ConnectCommand}" WidthRequest="60"/>
+                <Button Text="断开" Command="{Binding DisconnectCommand}" WidthRequest="60" IsEnabled="{Binding IsConnected}"/>
+            </HorizontalStackLayout>
+            <HorizontalStackLayout Spacing="8">
+                <Label Text="对端 ID:" VerticalOptions="Center" WidthRequest="70"/>
+                <Entry Text="{Binding PeerId}" WidthRequest="60" MaxLength="5" Keyboard="Numeric"/>
+                <Label Text="保存到:" VerticalOptions="Center" WidthRequest="50"/>
+                <Entry Text="{Binding SaveDirectory}" WidthRequest="200" Placeholder="接收目录"/>
+            </HorizontalStackLayout>
+            <HorizontalStackLayout Spacing="8">
+                <Entry Text="{Binding SelectedFile}" IsReadOnly="True" Placeholder="选择要发送的文件" HorizontalOptions="FillAndExpand"/>
+                <Button Text="选择文件" Command="{Binding PickFileCommand}" WidthRequest="90"/>
+                <Button Text="发送" Command="{Binding SendCommand}" WidthRequest="70" IsEnabled="{Binding IsConnected}"/>
+            </HorizontalStackLayout>
+            <Label Text="{Binding StatusText}" FontAttributes="Bold"/>
+            <ProgressBar Progress="{Binding ProgressRatio}" HeightRequest="8"/>
+            <Label Text="{Binding ProgressDetail}" TextColor="Gray" FontSize="12"/>
+            <Label Text="传输日志" FontAttributes="Bold"/>
+            <CollectionView ItemsSource="{Binding LogEntries}" HeightRequest="200" SelectionMode="None">
+                <CollectionView.ItemTemplate>
+                    <DataTemplate x:DataType="vm:LogEntry">
+                        <Grid Padding="4" ColumnDefinitions="Auto,*">
+                            <Label Grid.Column="0" Text="{Binding Time, StringFormat='{0:HH:mm:ss}'}" FontSize="12" TextColor="Gray" VerticalOptions="Center"/>
+                            <Label Grid.Column="1" Text="{Binding Message}" FontSize="13" LineBreakMode="WordWrap" VerticalOptions="Center"/>
+                        </Grid>
+                    </DataTemplate>
+                </CollectionView.ItemTemplate>
+            </CollectionView>
+        </VerticalStackLayout>
+    </ScrollView>
+</ContentPage>

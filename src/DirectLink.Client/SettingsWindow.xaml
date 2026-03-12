@@ -1,0 +1,24 @@
+<Window x:Class="DirectLink.Client.SettingsWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="服务器设置"
+        Width="360" Height="140"
+        WindowStartupLocation="CenterOwner"
+        ResizeMode="NoResize">
+    <Grid Margin="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,10">
+            <TextBlock Text="服务端地址：" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBox x:Name="TbServer" MinWidth="220" VerticalContentAlignment="Center" Padding="6,4"/>
+        </StackPanel>
+        <TextBlock Grid.Row="1" Text="例如 127.0.0.1:50000 或 服务器域名:50000" Foreground="Gray" FontSize="11" Margin="0,0,0,12"/>
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right">
+            <Button x:Name="BtnConnect" Content="连接" Width="80" Margin="0,0,8,0" Click="BtnConnect_OnClick"/>
+            <Button Content="关闭" Width="80" IsCancel="True" Click="BtnClose_OnClick"/>
+        </StackPanel>
+    </Grid>
+</Window>
