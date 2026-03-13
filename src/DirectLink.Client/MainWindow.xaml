@@ -2,7 +2,7 @@
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         Title="DirectLink 点对点传文件"
-        Width="560" Height="480"
+        Width="590" Height="480"
         WindowStartupLocation="CenterScreen"
         ResizeMode="CanResize"
         Loaded="MainWindow_Loaded">
@@ -24,7 +24,6 @@
             <TextBlock Text="  保存到：" VerticalAlignment="Center" Margin="10,0,0,0"/>
             <TextBox x:Name="TbSaveDir" MinWidth="180" VerticalContentAlignment="Center" Padding="4,2"/>
             <Button x:Name="BtnBrowseSave" Content="…" Width="28" Margin="4,0,0,0" Click="BtnBrowseSave_OnClick"/>
-            <Button x:Name="BtnSettingsOrDisconnect" Content="{Binding SettingsButtonText}" Width="72" Margin="12,0,0,0" Click="BtnSettingsOrDisconnect_OnClick" ToolTip="未连接时：设置服务端地址与端口并连接；已连接时：断开"/>
         </StackPanel>
 
         <!-- 第二行：拖拽区 + 选择文件 + 发送 (Alt+S) -->
@@ -96,7 +95,7 @@
                                 IsEnabled="{Binding IsDisconnected}"/>
                         <Button x:Name="BtnDisconnect" Content="断开" Width="56" Margin="8,0,0,0" Click="BtnDisconnect_OnClick"
                                 IsEnabled="{Binding IsConnected}"/>
-                        <Button x:Name="BtnSettings" Content="设置" Width="56" Margin="8,0,0,0" Click="BtnSettings_OnClick"/>
+                        <Button x:Name="BtnSettings" Content="设置服务器..." Width="86" Margin="8,0,0,0" Click="BtnSettings_OnClick"/>
                     </StackPanel>
                     <Button x:Name="BtnExportLog" Grid.Column="1" Content="导出日志…" Width="90" Click="BtnExportLog_OnClick"/>
                 </Grid>

@@ -230,7 +230,40 @@ public class RelayService : IAsyncDisposable
     }
 
     /// <summary>
-    /// 查询对端 P2P 地址；成功返回 (peerHost, peerPort)。
+    /// 检查对端是否在线（已注册且可经中继发送）。仅走中转时使用。
+    /// </summary>
+    public async Task<bool> IsPeerOnlineAsync(string peerId, CancellationToken ct = default)
+    {
+        if (_writer == null || _reader == null)
+            return false;
+        var tcs = new TaskCompletionSource<string?>();
+        lock (_readLock)
+        {
+            if (_pendingQueryResponse != null)
+                _pendingQueryResponse.TrySetCanceled();
+            _pendingQueryResponse = tcs;
+        }
+        await _writer.WriteLineAsync($"QUERY {_clientId} {peerId}");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(TimeSpan.FromSeconds(15));
+        try
+        {
+            var line = await tcs.Task.WaitAsync(cts.Token);
+            if (string.IsNullOrEmpty(line)) return false;
+            var t = line.Trim();
+            if (t.StartsWith(ServerCommands.Err, StringComparison.OrdinalIgnoreCase)) return false;
+            if (t.StartsWith(ServerCommands.RelayOk, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            lock (_readLock) { _pendingQueryResponse = null; }
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// 查询对端 P2P 地址；成功返回 (peerHost, peerPort)。（已废弃，仅中转时用 IsPeerOnlineAsync）
     /// </summary>
     public async Task<(string? peerHost, int? peerPort)> QueryPeerAsync(string peerId, CancellationToken ct = default)
     {

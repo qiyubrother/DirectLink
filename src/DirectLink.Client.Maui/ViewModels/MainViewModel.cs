@@ -1,8 +1,6 @@
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.IO;
-using System.Net;
-using System.Net.Sockets;
 using System.Runtime.CompilerServices;
 using System.Windows.Input;
 using DirectLink.Client.Maui.Config;
@@ -49,10 +47,6 @@ public class MainViewModel : INotifyPropertyChanged
 
     private RelayService? _relay;
     private CancellationTokenSource? _listenCts;
-    private Task? _listenTask;
-    private TcpListener? _p2pListener;
-    private int _p2pPort = P2PTransferService.P2PListenPortBase;
-    private const int P2PConnectTimeoutSeconds = 45;
 
     /// <summary>由页面设置，用于显示弹窗（标题, 消息）</summary>
     public Action<string, string>? ShowAlert { get; set; }
@@ -80,24 +74,19 @@ public class MainViewModel : INotifyPropertyChanged
         await Task.Yield();
         try
         {
-            try { _p2pListener?.Stop(); } catch { }
-            _p2pListener = null;
             _listenCts?.Cancel();
             await (_relay?.DisposeAsync() ?? ValueTask.CompletedTask);
             _relay = new RelayService(host, port, ClientId);
             _relay.IncomingSendRequest += OnIncomingSendRequest;
             await _relay.ConnectAndRegisterAsync();
             _listenCts = new CancellationTokenSource();
-            _p2pPort = P2PTransferService.P2PListenPortBase + int.Parse(ClientId) % 1000;
-            await RelayService.ReportP2PPortAsync(host, port, ClientId, _p2pPort, _listenCts.Token);
-            _p2pListener = new TcpListener(IPAddress.IPv6Any, _p2pPort);
-            _p2pListener.Server.DualMode = true;
-            _p2pListener.Start();
-            _listenTask = Task.Run(() => AcceptLoopAsync(_listenCts.Token), _listenCts.Token);
+            var relayStream = await _relay.OpenRelayReceiverAsync(_listenCts.Token);
+            if (relayStream != null)
+                _ = Task.Run(() => RelayReceiveLoopAsync(relayStream, _listenCts!.Token), _listenCts.Token);
             MainThread.BeginInvokeOnMainThread(() =>
             {
                 IsConnected = true;
-                StatusText = $"已连接 {host}:{port}，P2P 端口 {_p2pPort}";
+                StatusText = $"已连接 {host}:{port}";
             });
             AddLog("连接", $"已连接中继服务器 {host}:{port}");
         }
@@ -109,81 +98,54 @@ public class MainViewModel : INotifyPropertyChanged
         }
     }
 
-    private async Task AcceptLoopAsync(CancellationToken ct)
+    private async Task RelayReceiveLoopAsync(Stream relayStream, CancellationToken ct)
     {
-        var listener = _p2pListener;
-        if (listener == null) return;
+        var saveDir = string.IsNullOrWhiteSpace(SaveDirectory)
+            ? Path.Combine(FileSystem.AppDataDirectory, "DirectLinkReceived")
+            : SaveDirectory;
+        var progress = new Progress<TransferProgress>(p =>
+        {
+            MainThread.BeginInvokeOnMainThread(() =>
+            {
+                ProgressPercent = p.Total > 0 ? 100.0 * p.Current / p.Total : 0;
+                ProgressDetail = $"{FormatSize(p.Current)} / {FormatSize(p.Total)} {FormatSpeed(p.BytesPerSecond)}";
+            });
+        });
         try
         {
+            var fileIndex = 0;
             while (!ct.IsCancellationRequested)
             {
-                var client = await listener.AcceptTcpClientAsync(ct);
-                try
+                fileIndex++;
+                TransferFileLogger.Write("RelayRecv", $"等待第 {fileIndex} 个文件…");
+                MainThread.BeginInvokeOnMainThread(() => { IsTransferring = true; StatusText = "等待经中转的文件…"; });
+                var (savedPath, bytesReceived, hashOk) = await P2PTransferService.ReceiveFromStreamAsync(relayStream, saveDir, progress, ct);
+                var doBreak = bytesReceived == 0 && string.IsNullOrEmpty(savedPath);
+                TransferFileLogger.Write("RelayRecv", $"第 {fileIndex} 个文件: savedPath={savedPath ?? "(null)"}, bytesReceived={bytesReceived}, hashOk={hashOk}, doBreak={doBreak}");
+                MainThread.BeginInvokeOnMainThread(() =>
                 {
-                    var stream = client.GetStream();
-                    if (TryOfferAcceptedStream(stream, client)) continue;
-                }
-                catch { }
-                _ = HandleIncomingConnectionAsync(client, ct);
+                    IsTransferring = false;
+                    ProgressPercent = 0;
+                    ProgressDetail = "";
+                    if (!string.IsNullOrEmpty(savedPath))
+                    {
+                        StatusText = hashOk ? "接收完成（经中转），哈希校验通过" : "接收完成（经中转），哈希校验失败";
+                        AddLog("接收", $"[中转] {savedPath} ({bytesReceived} 字节) 校验: {(hashOk ? "通过" : "失败")}");
+                    }
+                    else if (bytesReceived > 0)
+                    {
+                        StatusText = "接收未完成或失败（经中转）";
+                        AddLog("接收", $"[中转] 未完成，已接收 {bytesReceived} 字节");
+                    }
+                });
+                if (doBreak) break;
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
-            MainThread.BeginInvokeOnMainThread(() => AddLog("监听", ex.Message));
-        }
-    }
-
-    private async Task HandleIncomingConnectionAsync(TcpClient client, CancellationToken ct)
-    {
-        try
-        {
-            await using var stream = client.GetStream();
-            MainThread.BeginInvokeOnMainThread(() => { IsTransferring = true; StatusText = "正在接收文件…"; });
-            var progress = new Progress<TransferProgress>(p =>
-            {
-                MainThread.BeginInvokeOnMainThread(() =>
-                {
-                    ProgressPercent = p.Total > 0 ? 100.0 * p.Current / p.Total : 0;
-                    ProgressDetail = $"{FormatSize(p.Current)} / {FormatSize(p.Total)} {FormatSpeed(p.BytesPerSecond)}";
-                });
-            });
-            var saveDir = string.IsNullOrWhiteSpace(SaveDirectory)
-                ? Path.Combine(FileSystem.AppDataDirectory, "DirectLinkReceived")
-                : SaveDirectory;
-            var (savedPath, bytesReceived, hashOk) = await P2PTransferService.ReceiveFromStreamAsync(stream, saveDir, progress, ct);
-            MainThread.BeginInvokeOnMainThread(() =>
-            {
-                IsTransferring = false;
-                ProgressPercent = 0;
-                ProgressDetail = "";
-                if (!string.IsNullOrEmpty(savedPath))
-                {
-                    StatusText = hashOk ? "接收完成，哈希校验通过" : "接收完成，哈希校验失败";
-                    AddLog("接收", $"{savedPath} ({bytesReceived} 字节) 校验: {(hashOk ? "通过" : "失败")}");
-                    ShowAlert?.Invoke("传输完成", hashOk ? $"文件已保存。\n{savedPath}\n哈希校验通过。" : $"文件已保存。\n{savedPath}\n哈希校验未通过。");
-                }
-                else
-                {
-                    StatusText = "接收未完成或失败";
-                    AddLog("接收", $"未完成，已接收 {bytesReceived} 字节");
-                }
-            });
-        }
-        catch (Exception ex)
-        {
-            MainThread.BeginInvokeOnMainThread(() =>
-            {
-                IsTransferring = false;
-                ProgressPercent = 0;
-                ProgressDetail = "";
-                StatusText = "接收异常";
-                AddLog("接收", "异常: " + ex.Message);
-            });
-        }
-        finally
-        {
-            try { client.Close(); } catch { }
+            TransferFileLogger.Write("RelayRecv", $"接收循环异常: {ex.GetType().Name} - {ex.Message}");
+            MainThread.BeginInvokeOnMainThread(() => AddLog("中继接收", ex.Message));
         }
     }
 
@@ -199,19 +161,19 @@ public class MainViewModel : INotifyPropertyChanged
             StatusText = "对端 ID 须为 3 位数字";
             return;
         }
-        var (peerHost, peerPort) = await _relay.QueryPeerAsync(PeerId);
-        if (peerHost == null || peerPort == null)
+        if (!await _relay.IsPeerOnlineAsync(PeerId))
         {
-            StatusText = "对端不在线或未上报 P2P 端口";
+            StatusText = "对端不在线";
             AddLog("发送", "对端不可达");
             return;
         }
-        IsTransferring = true;
-        StatusText = "正在建立直连…";
-        var peerHostCopy = peerHost;
-        var peerPortCopy = peerPort.Value;
+        var serverParts = ServerAddress.Trim().Split(':', StringSplitOptions.RemoveEmptyEntries);
+        var serverHost = serverParts.Length > 0 ? serverParts[0].Trim() : "127.0.0.1";
+        var serverPort = serverParts.Length > 1 && int.TryParse(serverParts[1], out var sp) ? sp : 50000;
         var filePath = SelectedFile;
         var peerIdCopy = PeerId;
+        IsTransferring = true;
+        StatusText = "正在经服务器中转发送…";
         var progress = new Progress<TransferProgress>(p =>
         {
             MainThread.BeginInvokeOnMainThread(() =>
@@ -223,79 +185,86 @@ public class MainViewModel : INotifyPropertyChanged
 
         _ = Task.Run(async () =>
         {
-            TcpClient? toClose = null;
+            await SendSingleFileWithRetryAsync(serverHost, serverPort, peerIdCopy, filePath, progress);
+        });
+    }
+
+    private async Task SendSingleFileWithRetryAsync(string serverHost, int serverPort, string peerIdCopy, string filePath, IProgress<TransferProgress> progress)
+    {
+        const int maxAttempts = 12;
+        var fileName = Path.GetFileName(filePath);
+        long lastBytesSent = 0;
+        bool lastSuccess = false;
+        var attempt = 0;
+
+        while (attempt < maxAttempts)
+        {
+            attempt++;
+            if (_relay == null || _listenCts?.IsCancellationRequested == true)
+            {
+                TransferFileLogger.Write("RelaySend", $"(Maui) 发送中止（已断开）：{fileName}");
+                break;
+            }
+
             try
             {
-                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(P2PConnectTimeoutSeconds));
-                var client = new TcpClient();
-                await client.ConnectAsync(peerHostCopy, peerPortCopy, cts.Token);
-                toClose = client;
-                var stream = client.GetStream();
-                MainThread.BeginInvokeOnMainThread(() => StatusText = "正在发送…");
-                var (bytesSent, success) = await P2PTransferService.SendFileToStreamAsync(stream, filePath, 0, progress);
+                TransferFileLogger.Write("RelaySend", $"(Maui) 尝试 {attempt}/{maxAttempts} 发送: {fileName}");
+                var (bytesSent, success) = await RelayService.SendFileViaRelayAsync(serverHost, serverPort, ClientId, peerIdCopy, filePath, progress);
+                lastBytesSent = bytesSent;
+                lastSuccess = success;
+                if (success)
+                {
+                    MainThread.BeginInvokeOnMainThread(() =>
+                    {
+                        IsTransferring = false;
+                        ProgressPercent = 0;
+                        ProgressDetail = "";
+                        StatusText = "发送完成";
+                        AddLog("发送", $"到 {peerIdCopy}：{fileName} ({bytesSent} 字节) 完成（第 {attempt} 次尝试）");
+                    });
+                    return;
+                }
                 MainThread.BeginInvokeOnMainThread(() =>
                 {
-                    IsTransferring = false;
-                    ProgressPercent = 0;
-                    ProgressDetail = "";
-                    if (success)
-                    {
-                        StatusText = "发送完成，已校验";
-                        AddLog("发送", $"到 {peerIdCopy}：{Path.GetFileName(filePath)} ({bytesSent} 字节) 完成");
-                        ShowAlert?.Invoke("传输完成", $"已向 {peerIdCopy} 发送完成。\n文件: {Path.GetFileName(filePath)}\n大小: {FormatSize(bytesSent)}");
-                    }
-                    else
-                    {
-                        StatusText = "发送未完成";
-                        AddLog("发送", $"到 {peerIdCopy}：已发送 {bytesSent} 字节，未完成");
-                    }
-                });
-            }
-            catch (OperationCanceledException)
-            {
-                MainThread.BeginInvokeOnMainThread(() =>
-                {
-                    IsTransferring = false;
-                    ProgressPercent = 0;
-                    ProgressDetail = "";
-                    StatusText = "建立直连超时，请确认对端已连接且网络可达";
-                    AddLog("发送", "建立直连超时");
+                    StatusText = "发送未完成，将重试";
+                    AddLog("发送", $"到 {peerIdCopy}：{fileName} 未完成（第 {attempt} 次）");
                 });
             }
             catch (Exception ex)
             {
+                lastSuccess = false;
                 MainThread.BeginInvokeOnMainThread(() =>
                 {
-                    IsTransferring = false;
-                    ProgressPercent = 0;
-                    ProgressDetail = "";
-                    StatusText = "发送失败: " + ex.Message;
-                    AddLog("发送", ex.Message);
+                    StatusText = "经中转发送失败: " + ex.Message;
+                    AddLog("发送", $"[中转] {fileName} 第 {attempt} 次异常: {ex.Message}");
                 });
             }
-            finally
+
+            if (attempt < maxAttempts)
             {
-                try { toClose?.Close(); } catch { }
+                var delayMs = 1500 + Math.Min(attempt * 500, 5000);
+                await Task.Delay(delayMs);
             }
+        }
+
+        MainThread.BeginInvokeOnMainThread(() =>
+        {
+            IsTransferring = false;
+            ProgressPercent = 0;
+            ProgressDetail = "";
+            StatusText = "发送失败";
+            AddLog("发送", $"到 {peerIdCopy}：{fileName} 已放弃（共 {attempt} 次，Success={lastSuccess}）");
         });
     }
 
     private void OnIncomingSendRequest(string senderId, string host, int port)
     {
-        MainThread.BeginInvokeOnMainThread(() =>
-        {
-            StatusText = $"发送方 {senderId} 将连接至本机，请稍候…";
-            AddLog("接收", $"发送方 {senderId} 准备发送，等待对方连入…");
-        });
+        // 仅中转模式，不再使用 INCOMING 通知
     }
-
-    public bool TryOfferAcceptedStream(Stream stream, TcpClient client) => false;
 
     public void Disconnect()
     {
         _listenCts?.Cancel();
-        try { _p2pListener?.Stop(); } catch { }
-        _p2pListener = null;
         var r = _relay;
         _relay = null;
         if (r != null)

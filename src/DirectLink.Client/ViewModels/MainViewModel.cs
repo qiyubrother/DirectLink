@@ -1,8 +1,6 @@
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
-using System.Net;
-using System.Net.Sockets;
 using DirectLink.Client.Config;
 using DirectLink.Client.Services;
 using WpfApp = System.Windows;
@@ -25,14 +23,6 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
     private int _transferFileTotal;
     private RelayService? _relay;
     private CancellationTokenSource? _listenCts;
-    private Task? _listenTask;
-    private Socket? _p2pSocket;
-    private int _p2pPort = P2PTransferService.P2PListenPortBase;
-    /// <summary>发送时等待“对端连上我们”提供的流，与“我们连对端”二选一</summary>
-    private TaskCompletionSource<(Stream stream, Socket? toClose)>? _pendingSendStreamTcs;
-
-    /// <summary>直连建立超时（秒），双方尝试连接时给足时间，避免高延迟/跨网段超时</summary>
-    private const int P2PConnectTimeoutSeconds = 45;
 
     public MainViewModel()
     {
@@ -98,7 +88,7 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
         set { _progressDetail = value; OnPropertyChanged(nameof(ProgressDetail)); }
     }
 
-    /// <summary>传输方式显示：直连 / 中转</summary>
+    /// <summary>传输方式显示：仅中转</summary>
     public string TransferModeText
     {
         get => _transferModeText;
@@ -268,18 +258,6 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
                 throw new InvalidOperationException("连接服务器失败，请稍后重试");
             TransferFileLogger.WriteConnectDebug("ConnectAsync", "ConnectAndRegisterAsync 完成");
             _listenCts = new CancellationTokenSource();
-            TransferFileLogger.WriteConnectDebug("ConnectAsync", "创建 P2P Socket 并 Bind(0) 由系统分配端口");
-            _p2pSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
-            _p2pSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true);
-            _p2pSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Linger, new LingerOption(true, 0));
-            _p2pSocket.Bind(new IPEndPoint(IPAddress.Any, 0));
-            _p2pPort = ((IPEndPoint)_p2pSocket.LocalEndPoint!).Port;
-            TransferFileLogger.WriteConnectDebug("ConnectAsync", $"P2P 端口已分配: {_p2pPort}");
-            _p2pSocket.Listen(100);
-            TransferFileLogger.WriteConnectDebug("ConnectAsync", $"向服务器上报 P2P 端口 {_p2pPort}");
-            await RelayService.ReportP2PPortAsync(host, port, ClientId, _p2pPort, _listenCts.Token);
-            TransferFileLogger.WriteConnectDebug("ConnectAsync", "ReportP2PPort 完成，启动 AcceptLoop");
-            _listenTask = Task.Run(() => AcceptLoopAsync(_listenCts.Token), _listenCts.Token);
             TransferFileLogger.WriteConnectDebug("ConnectAsync", "OpenRelayReceiverAsync");
             var relayStream = await _relay.OpenRelayReceiverAsync(_listenCts.Token);
             if (relayStream != null)
@@ -287,7 +265,7 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
             WpfApp.Application.Current?.Dispatcher.Invoke(() =>
             {
                 IsConnected = true;
-                StatusText = $"已连接 {host}:{port}，P2P 端口 {_p2pPort}";
+                StatusText = $"已连接 {host}:{port}";
             });
             TransferFileLogger.WriteConnectDebug("ConnectAsync", "连接成功");
             AddLog("连接", $"已连接中继服务器 {host}:{port}");
@@ -314,10 +292,15 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
         });
         try
         {
+            var fileIndex = 0;
             while (!ct.IsCancellationRequested)
             {
+                fileIndex++;
+                TransferFileLogger.Write("RelayRecv", $"等待第 {fileIndex} 个文件…");
                 WpfApp.Application.Current?.Dispatcher.Invoke(() => { IsTransferring = true; StatusText = "等待经中转的文件…"; });
                 var (savedPath, bytesReceived, hashOk) = await P2PTransferService.ReceiveFromStreamAsync(relayStream, SaveDirectory, progress, ct);
+                var doBreak = bytesReceived == 0 && string.IsNullOrEmpty(savedPath);
+                TransferFileLogger.Write("RelayRecv", $"第 {fileIndex} 个文件: savedPath={savedPath ?? "(null)"}, bytesReceived={bytesReceived}, hashOk={hashOk}, doBreak={doBreak}");
                 WpfApp.Application.Current?.Dispatcher.Invoke(() =>
                 {
                     IsTransferring = false;
@@ -328,11 +311,6 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
                         TransferModeText = "中转";
                         StatusText = hashOk ? "接收完成（经中转），哈希校验通过" : "接收完成（经中转），哈希校验失败";
                         AddLog("接收", $"[中转] {savedPath} ({bytesReceived} 字节) 校验: {(hashOk ? "通过" : "失败")}");
-                        WpfApp.MessageBox.Show(
-                            hashOk ? $"文件已保存（经服务器中转）。\n{savedPath}\n哈希校验通过。" : $"文件已保存（经服务器中转）。\n{savedPath}\n哈希校验未通过。",
-                            "传输完成",
-                            WpfApp.MessageBoxButton.OK,
-                            hashOk ? WpfApp.MessageBoxImage.Information : WpfApp.MessageBoxImage.Warning);
                     }
                     else if (bytesReceived > 0)
                     {
@@ -340,94 +318,14 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
                         AddLog("接收", $"[中转] 未完成，已接收 {bytesReceived} 字节");
                     }
                 });
-                if (bytesReceived == 0 && string.IsNullOrEmpty(savedPath)) break;
+                if (doBreak) break;
             }
         }
         catch (OperationCanceledException) { }
         catch (Exception ex)
         {
+            TransferFileLogger.Write("RelayRecv", $"接收循环异常: {ex.GetType().Name} - {ex.Message}");
             WpfApp.Application.Current?.Dispatcher.Invoke(() => AddLog("中继接收", ex.Message));
-        }
-    }
-
-    private async Task AcceptLoopAsync(CancellationToken ct)
-    {
-        var socket = _p2pSocket;
-        if (socket == null) { TransferFileLogger.WriteConnectDebug("AcceptLoop", "socket==null 直接返回"); return; }
-        try
-        {
-            while (!ct.IsCancellationRequested)
-            {
-                Socket? accepted = null;
-                try
-                {
-                    accepted = await socket.AcceptAsync(ct);
-                    var stream = new NetworkStream(accepted, ownsSocket: false);
-                    if (TryOfferAcceptedStream(stream, accepted))
-                        continue;
-                    _ = HandleIncomingConnectionAsync(stream, accepted, ct);
-                }
-                catch (Exception)
-                {
-                    try { accepted?.Close(); } catch { }
-                }
-            }
-            TransferFileLogger.WriteConnectDebug("AcceptLoop", "循环退出(已取消)");
-        }
-        catch (OperationCanceledException) { TransferFileLogger.WriteConnectDebug("AcceptLoop", "OperationCanceledException 退出"); }
-        catch (ObjectDisposedException) { TransferFileLogger.WriteConnectDebug("AcceptLoop", "ObjectDisposedException 退出(Socket已Close)"); }
-        catch (Exception ex)
-        {
-            TransferFileLogger.WriteConnectDebug("AcceptLoop 异常", ex.GetType().Name + ": " + ex.Message);
-            WpfApp.Application.Current?.Dispatcher.Invoke(() => AddLog("监听", ex.Message));
-        }
-    }
-
-    private async Task HandleIncomingConnectionAsync(Stream stream, Socket? toClose, CancellationToken ct)
-    {
-        try
-        {
-            WpfApp.Application.Current?.Dispatcher.Invoke(() =>
-            {
-                IsTransferring = true;
-                StatusText = "正在接收文件…";
-            });
-            var progress = new Progress<TransferProgress>(p =>
-            {
-                WpfApp.Application.Current?.Dispatcher.Invoke(() =>
-                {
-                    ProgressPercent = p.Total > 0 ? 100.0 * p.Current / p.Total : 0;
-                    var speed = p.BytesPerSecond > 0 ? $"{FormatSpeed(p.BytesPerSecond)}" : "";
-                    ProgressDetail = $"{FormatSize(p.Current)} / {FormatSize(p.Total)} {speed}";
-                });
-            });
-            var (savedPath, bytesReceived, hashOk) = await P2PTransferService.ReceiveFromStreamAsync(stream, SaveDirectory, progress, ct);
-            WpfApp.Application.Current?.Dispatcher.Invoke(() =>
-            {
-                IsTransferring = false;
-                ProgressPercent = 0;
-                ProgressDetail = "";
-                if (!string.IsNullOrEmpty(savedPath))
-                {
-                    TransferModeText = "直连";
-                    StatusText = hashOk ? "接收完成，哈希校验通过" : "接收完成，哈希校验失败";
-                    AddLog("接收", $"{savedPath} ({bytesReceived} 字节) 校验: {(hashOk ? "通过" : "失败")}");
-                    WpfApp.MessageBox.Show(
-                        hashOk ? $"文件已保存到:\n{savedPath}\n哈希校验通过。" : $"文件已保存到:\n{savedPath}\n哈希校验未通过，请核对。",
-                        "传输完成",
-                        WpfApp.MessageBoxButton.OK,
-                        hashOk ? WpfApp.MessageBoxImage.Information : WpfApp.MessageBoxImage.Warning);
-                }
-                else
-                {
-                    StatusText = "接收未完成或失败";
-                    AddLog("接收", $"未完成，已接收 {bytesReceived} 字节");
-                }
-            });
-        }
-        finally
-        {
-            try { toClose?.Close(); } catch { }
         }
     }
 
@@ -449,10 +347,9 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
             StatusText = "请选择或拖入要发送的文件/文件夹";
             return;
         }
-        var (peerHost, peerPort) = await _relay.QueryPeerAsync(PeerId);
-        if (peerHost == null || peerPort == null)
+        if (!await _relay.IsPeerOnlineAsync(PeerId))
         {
-            StatusText = "对端不在线或未上报 P2P 端口";
+            StatusText = "对端不在线";
             AddLog("发送", "对端不可达");
             return;
         }
@@ -463,7 +360,7 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
         IsTransferring = true;
         TransferFileTotal = files.Count;
         TransferFileIndex = 0;
-        TransferModeText = "";
+        TransferModeText = "中转";
 
         var progress = new Progress<TransferProgress>(p =>
         {
@@ -479,13 +376,13 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
 
         _ = Task.Run(async () =>
         {
-            var lastMode = "";
             for (var i = 0; i < files.Count; i++)
             {
                 var filePath = files[i];
+                TransferFileLogger.Write("RelaySend", $"发送第 {i + 1}/{files.Count} 个文件: {Path.GetFileName(filePath)}");
                 WpfApp.Application.Current?.Dispatcher.Invoke(() => TransferFileIndex = i + 1);
-                var usedRelay = await SendOneFileAsync(peerHost, peerPort.Value, serverHost, serverPort, peerIdCopy, filePath, progress);
-                lastMode = usedRelay ? "中转" : "直连";
+                WpfApp.Application.Current?.Dispatcher.Invoke(() => StatusText = "正在经服务器中转发送…");
+                await SendOneFileWithRetryAsync(serverHost, serverPort, peerIdCopy, filePath, progress);
             }
             WpfApp.Application.Current?.Dispatcher.Invoke(() =>
             {
@@ -494,111 +391,74 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
                 ProgressDetail = "";
                 TransferFileIndex = 0;
                 TransferFileTotal = 0;
-                TransferModeText = lastMode;
                 if (files.Count == 1)
                     StatusText = "发送完成";
                 else
                 {
-                    StatusText = $"已发送 {files.Count} 个文件（{lastMode}）";
-                    AddLog("发送", $"到 {peerIdCopy}：共 {files.Count} 个文件，{lastMode}");
+                    StatusText = $"已发送 {files.Count} 个文件";
+                    AddLog("发送", $"到 {peerIdCopy}：共 {files.Count} 个文件");
                 }
             });
         });
     }
 
-    /// <summary>发送单个文件，先直连失败则尝试中转。返回是否使用了中转。</summary>
-    private async Task<bool> SendOneFileAsync(string peerHost, int peerPort, string serverHost, int serverPort, string peerIdCopy, string filePath, IProgress<TransferProgress> progress)
+    /// <summary>经中转发送单个文件：有限次重试 + 退避，避免无限卡住；服务端已缓冲时发送端可快速完成。</summary>
+    private async Task SendOneFileWithRetryAsync(string serverHost, int serverPort, string peerIdCopy, string filePath, IProgress<TransferProgress> progress)
     {
-        System.Net.Sockets.TcpClient? toClose = null;
-        try
-        {
-            WpfApp.Application.Current?.Dispatcher.Invoke(() => StatusText = "正在建立直连…");
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(P2PConnectTimeoutSeconds));
-            var client = new System.Net.Sockets.TcpClient();
-            await client.ConnectAsync(peerHost, peerPort, cts.Token);
-            toClose = client;
-            var stream = client.GetStream();
-            WpfApp.Application.Current?.Dispatcher.Invoke(() => StatusText = "正在发送…");
-            var (bytesSent, success) = await P2PTransferService.SendFileToStreamAsync(stream, filePath, 0, progress);
-            WpfApp.Application.Current?.Dispatcher.Invoke(() =>
-            {
-                if (success)
-                    AddLog("发送", $"到 {peerIdCopy}：{Path.GetFileName(filePath)} ({bytesSent} 字节) 直连完成");
-            });
-            return false;
-        }
-        catch (OperationCanceledException)
-        {
-            return await TryRelayOnDirectFailureAsync(serverHost, serverPort, peerIdCopy, filePath, progress, "建立直连超时");
-        }
-        catch (Exception ex)
-        {
-            return await TryRelayOnDirectFailureAsync(serverHost, serverPort, peerIdCopy, filePath, progress, "发送失败: " + ex.Message);
-        }
-        finally
-        {
-            try { toClose?.Close(); } catch { }
-        }
-    }
+        const int maxAttempts = 12;
+        var fileName = Path.GetFileName(filePath);
+        long lastBytesSent = 0;
+        bool lastSuccess = false;
+        var attempt = 0;
 
-    private async Task<bool> TryRelayOnDirectFailureAsync(string serverHost, int serverPort, string peerIdCopy, string filePath, IProgress<TransferProgress> progress, string failureMessage)
-    {
-        var useRelay = false;
+        while (attempt < maxAttempts)
+        {
+            attempt++;
+            if (_relay == null || _listenCts?.IsCancellationRequested == true)
+            {
+                TransferFileLogger.Write("RelaySend", $"发送中止（已断开）：{fileName}");
+                break;
+            }
+
+            try
+            {
+                TransferFileLogger.Write("RelaySend", $"尝试 {attempt}/{maxAttempts} 发送: {fileName}");
+                var (bytesSent, success) = await RelayService.SendFileViaRelayAsync(serverHost, serverPort, ClientId, peerIdCopy, filePath, progress);
+                lastBytesSent = bytesSent;
+                lastSuccess = success;
+                if (success)
+                {
+                    WpfApp.Application.Current?.Dispatcher.Invoke(() =>
+                        AddLog("发送", $"到 {peerIdCopy}：{fileName} ({bytesSent} 字节) 完成（第 {attempt} 次尝试）"));
+                    return;
+                }
+                WpfApp.Application.Current?.Dispatcher.Invoke(() =>
+                    AddLog("发送", $"到 {peerIdCopy}：{fileName} 未完成 {bytesSent} 字节（第 {attempt} 次），将重试"));
+            }
+            catch (Exception ex)
+            {
+                lastSuccess = false;
+                WpfApp.Application.Current?.Dispatcher.Invoke(() =>
+                {
+                    StatusText = "经中转发送失败: " + ex.Message;
+                    AddLog("发送", $"[中转] {fileName} 第 {attempt} 次异常: {ex.Message}");
+                });
+            }
+
+            if (attempt < maxAttempts)
+            {
+                var delayMs = 1500 + Math.Min(attempt * 500, 5000);
+                await Task.Delay(delayMs);
+            }
+        }
+
         WpfApp.Application.Current?.Dispatcher.Invoke(() =>
-        {
-            StatusText = failureMessage;
-            AddLog("发送", failureMessage);
-            useRelay = WpfApp.MessageBox.Show(
-                "直连失败，是否经服务器中转？\n（会占用服务器带宽）",
-                "经服务器中转",
-                WpfApp.MessageBoxButton.YesNo,
-                WpfApp.MessageBoxImage.Question) == WpfApp.MessageBoxResult.Yes;
-        });
-        if (!useRelay) return false;
-        WpfApp.Application.Current?.Dispatcher.Invoke(() => StatusText = "正在经服务器中转发送…");
-        try
-        {
-            var (bytesSent, success) = await RelayService.SendFileViaRelayAsync(serverHost, serverPort, ClientId, peerIdCopy, filePath, progress);
-            WpfApp.Application.Current?.Dispatcher.Invoke(() =>
-            {
-                if (success)
-                    AddLog("发送", $"[中转] 到 {peerIdCopy}：{Path.GetFileName(filePath)} ({bytesSent} 字节) 完成");
-                else
-                    AddLog("发送", $"[中转] 到 {peerIdCopy}：已发送 {bytesSent} 字节，未完成");
-            });
-            return true;
-        }
-        catch (Exception ex)
-        {
-            WpfApp.Application.Current?.Dispatcher.Invoke(() =>
-            {
-                StatusText = "经中转发送失败: " + ex.Message;
-                AddLog("发送", "[中转] " + ex.Message);
-            });
-            return false;
-        }
+            AddLog("发送", $"到 {peerIdCopy}：{fileName} 已放弃（共 {attempt} 次，最后 {lastBytesSent} 字节，Success={lastSuccess}）"));
     }
 
-    /// <summary>
-    /// 收到服务端下发的 INCOMING：发送方将主动连到本机，本机只做监听、不主动连发送方，避免 NAT 导致“连发送方超时”报错。
-    /// </summary>
     private void OnIncomingSendRequest(string senderId, string host, int port)
     {
-        WpfApp.Application.Current?.Dispatcher.Invoke(() =>
-        {
-            StatusText = $"发送方 {senderId} 将连接至本机，请稍候…";
-            AddLog("接收", $"发送方 {senderId} 准备发送，等待对方连入…");
-        });
-    }
-
-    /// <summary>由监听线程调用：若当前有“等待对端连上来发文件”，则把接受的连接交给发送路径并返回 true。</summary>
-    public bool TryOfferAcceptedStream(Stream stream, Socket? toClose)
-    {
-        var tcs = _pendingSendStreamTcs;
-        if (tcs == null) return false;
-        if (!tcs.TrySetResult((stream, toClose))) return false;
-        _pendingSendStreamTcs = null;
-        return true;
+        // 仅中转模式，不再使用 INCOMING 通知
     }
 
     public void Disconnect()
@@ -610,18 +470,6 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
     {
         TransferFileLogger.WriteConnectDebug("DisconnectAsync", "入口");
         _listenCts?.Cancel();
-        _pendingSendStreamTcs?.TrySetCanceled();
-        var listenTask = _listenTask;
-        _listenTask = null;
-        TransferFileLogger.WriteConnectDebug("DisconnectAsync", "关闭 P2P Socket 以唤醒 AcceptAsync");
-        try { _p2pSocket?.Close(); } catch (Exception ex) { TransferFileLogger.WriteConnectDebug("DisconnectAsync Close", ex.Message); }
-        _p2pSocket = null;
-        if (listenTask != null)
-        {
-            TransferFileLogger.WriteConnectDebug("DisconnectAsync", "等待监听任务退出(最多3秒)");
-            try { await listenTask.WaitAsync(TimeSpan.FromSeconds(3)); } catch (Exception ex) { TransferFileLogger.WriteConnectDebug("DisconnectAsync WaitAsync", ex.Message); }
-            TransferFileLogger.WriteConnectDebug("DisconnectAsync", "监听任务已退出");
-        }
         var r = _relay;
         _relay = null;
         if (r != null)
@@ -636,6 +484,7 @@ public class MainViewModel : System.ComponentModel.INotifyPropertyChanged
             IsConnected = false;
             StatusText = "未连接";
         });
+        IsTransferring = false;
         TransferFileLogger.WriteConnectDebug("DisconnectAsync", "完成");
         AddLog("连接", "已断开");
     }

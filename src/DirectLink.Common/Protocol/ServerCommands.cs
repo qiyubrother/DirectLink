@@ -14,10 +14,13 @@ public static class ServerCommands
     /// <summary>查询对端：QUERY &lt;SelfId&gt; &lt;PeerId&gt;</summary>
     public const string Query = "QUERY";
 
-    /// <summary>返回对端 P2P 地址：P2P &lt;IP&gt; &lt;Port&gt;</summary>
+    /// <summary>返回对端 P2P 地址：P2P &lt;IP&gt; &lt;Port&gt;（已废弃，仅走中转时返回 RELAY）</summary>
     public const string P2P = "P2P";
 
-    /// <summary>通知被呼叫方：INCOMING &lt;CallerId&gt; &lt;IP&gt; &lt;Port&gt;</summary>
+    /// <summary>对端在线、可经中继发送：RELAY</summary>
+    public const string RelayOk = "RELAY";
+
+    /// <summary>通知被呼叫方：INCOMING &lt;CallerId&gt; &lt;IP&gt; &lt;Port&gt;（已废弃）</summary>
     public const string Incoming = "INCOMING";
 
     /// <summary>成功</summary>

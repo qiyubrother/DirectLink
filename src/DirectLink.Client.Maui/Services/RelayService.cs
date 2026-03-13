@@ -42,33 +42,6 @@ public class RelayService : IAsyncDisposable
         throw lastEx ?? new InvalidOperationException("连接失败");
     }
 
-    private static async Task<TcpClient> ConnectPreferIPv6FromLocalPortAsync(string host, int port, int localPort, CancellationToken ct = default)
-    {
-        var endpoints = GetEndpointsPreferIPv6(host, port);
-        if (endpoints.Length == 0)
-            throw new InvalidOperationException($"无法解析主机: {host}");
-        Exception? lastEx = null;
-        foreach (var ep in endpoints)
-        {
-            var client = new TcpClient(ep.AddressFamily);
-            try
-            {
-                var local = ep.AddressFamily == AddressFamily.InterNetworkV6
-                    ? new IPEndPoint(IPAddress.IPv6Any, localPort)
-                    : new IPEndPoint(IPAddress.Any, localPort);
-                client.Client.Bind(local);
-                await client.ConnectAsync(ep, ct);
-                return client;
-            }
-            catch (Exception ex)
-            {
-                lastEx = ex;
-                try { client.Close(); } catch { }
-            }
-        }
-        throw lastEx ?? new InvalidOperationException("PORT_MAP 连接失败");
-    }
-
     private TcpClient? _controlClient;
     private StreamWriter? _writer;
     private StreamReader? _reader;
@@ -78,6 +51,8 @@ public class RelayService : IAsyncDisposable
     private CancellationTokenSource? _pingCts;
     private TaskCompletionSource<string?>? _pendingQueryResponse;
     private readonly object _readLock = new();
+    private TcpClient? _relayReceiverClient;
+    private Stream? _relayReceiverStream;
 
     public event Action<string, string, int>? IncomingSendRequest;
 
@@ -135,18 +110,75 @@ public class RelayService : IAsyncDisposable
         catch (Exception) { }
     }
 
-    public static async Task ReportP2PPortAsync(string serverHost, int serverPort, string clientId, int localPort, CancellationToken ct = default)
+    /// <summary>检查对端是否在线（已注册且可经中继发送）。</summary>
+    public async Task<bool> IsPeerOnlineAsync(string peerId, CancellationToken ct = default)
     {
-        var client = await ConnectPreferIPv6FromLocalPortAsync(serverHost, serverPort, localPort, ct);
+        if (_writer == null || _reader == null) return false;
+        var tcs = new TaskCompletionSource<string?>();
+        lock (_readLock)
+        {
+            _pendingQueryResponse?.TrySetCanceled();
+            _pendingQueryResponse = tcs;
+        }
+        await _writer.WriteLineAsync($"QUERY {_clientId} {peerId}");
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        cts.CancelAfter(TimeSpan.FromSeconds(15));
+        try
+        {
+            var line = await tcs.Task.WaitAsync(cts.Token);
+            if (string.IsNullOrEmpty(line)) return false;
+            var t = line.Trim();
+            if (t.StartsWith(ServerCommands.Err, StringComparison.OrdinalIgnoreCase)) return false;
+            if (t.StartsWith(ServerCommands.RelayOk, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
+        }
+        catch (OperationCanceledException)
+        {
+            lock (_readLock) { _pendingQueryResponse = null; }
+            return false;
+        }
+    }
+
+    /// <summary>连接中继端口并注册为接收方，返回用于接收经中继转发文件的流。</summary>
+    public async Task<Stream?> OpenRelayReceiverAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            try { _relayReceiverClient?.Close(); } catch { }
+            _relayReceiverClient = await ConnectPreferIPv6Async(_serverHost, _serverPort + 1, ct);
+            var stream = _relayReceiverClient.GetStream();
+            var w = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+            await w.WriteLineAsync($"{ServerCommands.RelayReg} {_clientId}");
+            await w.FlushAsync(ct);
+            _relayReceiverStream = stream;
+            return stream;
+        }
+        catch
+        {
+            _relayReceiverClient = null;
+            _relayReceiverStream = null;
+            return null;
+        }
+    }
+
+    /// <summary>经服务器中继发送文件到对端。</summary>
+    public static async Task<(long bytesSent, bool success)> SendFileViaRelayAsync(
+        string serverHost,
+        int serverPort,
+        string fromClientId,
+        string toPeerId,
+        string filePath,
+        IProgress<TransferProgress>? progress,
+        CancellationToken ct = default)
+    {
+        var client = await ConnectPreferIPv6Async(serverHost, serverPort + 1, ct);
         try
         {
             var stream = client.GetStream();
-            using var w = new StreamWriter(stream, Encoding.UTF8) { AutoFlush = true };
-            using var r = new StreamReader(stream, Encoding.UTF8);
-            await w.WriteLineAsync($"PORT_MAP {clientId}");
-            var line = await r.ReadLineAsync(ct);
-            if (string.IsNullOrEmpty(line) || !line.StartsWith(ServerCommands.Ok, StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException($"PORT_MAP 失败: {line}");
+            var w = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+            await w.WriteLineAsync($"{ServerCommands.Relay} {fromClientId} {toPeerId}");
+            await w.FlushAsync(ct);
+            return await P2PTransferService.SendFileToStreamAsync(stream, filePath, 0, progress);
         }
         finally
         {
@@ -206,6 +238,12 @@ public class RelayService : IAsyncDisposable
     {
         _pingCts?.Cancel();
         lock (_readLock) { _pendingQueryResponse?.TrySetCanceled(); }
+        if (_relayReceiverClient != null)
+        {
+            try { _relayReceiverClient.Close(); } catch { }
+            _relayReceiverClient = null;
+            _relayReceiverStream = null;
+        }
         try { _controlClient?.Close(); } catch { }
         _controlClient = null;
         _writer = null;

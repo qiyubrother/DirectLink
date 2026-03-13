@@ -14,13 +14,18 @@ Console.WriteLine($"[Server] 信令监听 0.0.0.0:{port}（IPv4），等待客�
 var relayPort = port + 1;
 var relayListener = new TcpListener(IPAddress.Any, relayPort);
 relayListener.Start();
-Console.WriteLine($"[Server] 中继监听 0.0.0.0:{relayPort}（IPv4），直连失败时可经此转发文件。");
+Console.WriteLine($"[Server] 中继监听 0.0.0.0:{relayPort}（IPv4），文件先缓冲再交付接收方。");
 
 var clients = new Dictionary<string, ClientSession>(StringComparer.Ordinal);
 var lockObj = new object();
-var relayReceivers = new ConcurrentDictionary<string, Stream>(StringComparer.Ordinal);
+var relayReceivers = new ConcurrentDictionary<string, TcpClient>(StringComparer.Ordinal);
+var pendingFiles = new ConcurrentDictionary<string, Queue<string>>(StringComparer.Ordinal);
+var queueLocks = new ConcurrentDictionary<string, object>(StringComparer.Ordinal);
+var delivering = new ConcurrentDictionary<string, bool>(StringComparer.Ordinal);
 
-_ = Task.Run(() => RelayAcceptLoopAsync(relayListener, relayReceivers));
+_ = Task.Run(() => RelayAcceptLoopAsync(relayListener, relayReceivers, pendingFiles, queueLocks, delivering));
+
+const int RelayChunkSize = 16 * 1024;
 
 while (true)
 {
@@ -28,15 +33,19 @@ while (true)
     _ = Task.Run(() => HandleClientAsync(tcp, clients, lockObj));
 }
 
-static async Task RelayAcceptLoopAsync(TcpListener relayListener, ConcurrentDictionary<string, Stream> relayReceivers)
+static async Task RelayAcceptLoopAsync(
+    TcpListener relayListener,
+    ConcurrentDictionary<string, TcpClient> relayReceivers,
+    ConcurrentDictionary<string, Queue<string>> pendingFiles,
+    ConcurrentDictionary<string, object> queueLocks,
+    ConcurrentDictionary<string, bool> delivering)
 {
-    const int bufSize = 64 * 1024;
-    var buffer = new byte[bufSize];
     while (true)
     {
         var tcp = await relayListener.AcceptTcpClientAsync();
         _ = Task.Run(async () =>
         {
+            var buffer = new byte[RelayChunkSize];
             try
             {
                 var stream = tcp.GetStream();
@@ -57,12 +66,13 @@ static async Task RelayAcceptLoopAsync(TcpListener relayListener, ConcurrentDict
                         tcp.Close();
                         return;
                     }
-                    if (relayReceivers.TryGetValue(id, out var oldStream))
+                    if (relayReceivers.TryGetValue(id, out var oldTcp))
                     {
-                        try { oldStream.Close(); } catch { }
+                        try { oldTcp.Close(); } catch { }
                     }
-                    relayReceivers[id] = stream;
+                    relayReceivers[id] = tcp;
                     Console.WriteLine($"[Server] RELAY_REG {id}");
+                    DeliverNextToReceiver(id, relayReceivers, pendingFiles, queueLocks, delivering);
                     return;
                 }
 
@@ -70,27 +80,42 @@ static async Task RelayAcceptLoopAsync(TcpListener relayListener, ConcurrentDict
                 {
                     var fromId = parts[1].Trim();
                     var toId = parts[2].Trim();
-                    if (!relayReceivers.TryGetValue(toId, out var receiverStream))
+                    if (!relayReceivers.ContainsKey(toId))
                     {
+                        Console.WriteLine($"[Server] RELAY {fromId} -> {toId} 失败：接收方 {toId} 未注册");
                         tcp.Close();
                         return;
                     }
-                    Console.WriteLine($"[Server] RELAY {fromId} -> {toId}");
+                    Console.WriteLine($"[Server] RELAY {fromId} -> {toId} 开始接收并缓冲");
+                    string? tempPath = null;
                     try
                     {
-                        int n;
-                        while ((n = await stream.ReadAsync(buffer)) > 0)
+                        tempPath = Path.Combine(Path.GetTempPath(), "DirectLink_" + Guid.NewGuid().ToString("N") + ".tmp");
+                        long total = 0;
+                        await using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None))
                         {
-                            lock (receiverStream)
+                            int n;
+                            while ((n = await stream.ReadAsync(buffer)) > 0)
                             {
-                                receiverStream.Write(buffer.AsSpan(0, n));
-                                receiverStream.Flush();
+                                await fs.WriteAsync(buffer.AsMemory(0, n));
+                                total += n;
                             }
                         }
+                        Console.WriteLine($"[Server] RELAY {fromId} -> {toId} 缓冲完成 {total} 字节 -> {tempPath}");
+
+                        var qLock = queueLocks.GetOrAdd(toId, _ => new object());
+                        lock (qLock)
+                        {
+                            var q = pendingFiles.GetOrAdd(toId, _ => new Queue<string>());
+                            q.Enqueue(tempPath);
+                        }
+                        DeliverNextToReceiver(toId, relayReceivers, pendingFiles, queueLocks, delivering);
                     }
-                    catch (IOException)
+                    catch (IOException ex)
                     {
-                        relayReceivers.TryRemove(toId, out _);
+                        Console.WriteLine($"[Server] RELAY {fromId} -> {toId} 读发送方异常: {ex.Message}");
+                        if (tempPath != null && File.Exists(tempPath))
+                            try { File.Delete(tempPath); } catch { }
                     }
                     tcp.Close();
                     return;
@@ -105,6 +130,67 @@ static async Task RelayAcceptLoopAsync(TcpListener relayListener, ConcurrentDict
             }
         });
     }
+}
+
+static void DeliverNextToReceiver(
+    string toId,
+    ConcurrentDictionary<string, TcpClient> relayReceivers,
+    ConcurrentDictionary<string, Queue<string>> pendingFiles,
+    ConcurrentDictionary<string, object> queueLocks,
+    ConcurrentDictionary<string, bool> delivering)
+{
+    string? path = null;
+    var qLock = queueLocks.GetOrAdd(toId, _ => new object());
+    lock (qLock)
+    {
+        if (delivering.GetOrAdd(toId, _ => false))
+            return;
+        if (!pendingFiles.TryGetValue(toId, out var q) || q.Count == 0)
+            return;
+        if (!relayReceivers.TryGetValue(toId, out _))
+            return;
+        path = q.Dequeue();
+        delivering[toId] = true;
+    }
+
+    _ = Task.Run(async () =>
+    {
+        try
+        {
+            if (!relayReceivers.TryGetValue(toId, out var receiverTcp))
+            {
+                try { if (path != null && File.Exists(path)) File.Delete(path); } catch { }
+                return;
+            }
+            var receiverStream = receiverTcp.GetStream();
+            var buf = new byte[RelayChunkSize];
+            await using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, bufferSize: RelayChunkSize, useAsync: true))
+            {
+                int n;
+                while ((n = await fs.ReadAsync(buf)) > 0)
+                {
+                    lock (receiverStream)
+                    {
+                        receiverStream.Write(buf, 0, n);
+                        receiverStream.Flush();
+                    }
+                }
+            }
+            try { File.Delete(path); } catch { }
+            Console.WriteLine($"[Server] 已交付 1 个文件给 {toId}");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"[Server] 交付 {toId} 异常: {ex.Message}");
+            try { if (path != null && File.Exists(path)) File.Delete(path); } catch { }
+        }
+        finally
+        {
+            lock (queueLocks.GetOrAdd(toId, _ => new object()))
+                delivering[toId] = false;
+            DeliverNextToReceiver(toId, relayReceivers, pendingFiles, queueLocks, delivering);
+        }
+    });
 }
 
 static async Task<string?> ReadLineAsync(Stream stream)
@@ -150,50 +236,6 @@ static async Task HandleClientAsync(TcpClient tcp, Dictionary<string, ClientSess
 
         var cmd = parts[0].ToUpperInvariant();
         var clientId = parts[1].Trim();
-
-        if (cmd == ServerCommands.PortMap)
-        {
-            // PORT_MAP <ClientId> [ListenPort]：
-            // 当前连接的 RemoteEndPoint.Address 作为客户端对外地址，
-            // 若提供 ListenPort，则使用该端口作为 P2P 端口（而不是本次连接的本地端口），
-            // 这样客户端无需在本连接上绑定同一端口，避免端口复用冲突。
-            if (!IsValidClientId(clientId))
-            {
-                await writer.WriteLineAsync($"{ServerCommands.Err} invalid_id");
-                return;
-            }
-            int? reportedPort = null;
-            if (parts.Length >= 3 && int.TryParse(parts[2], out var rp) && rp > 0 && rp <= 65535)
-                reportedPort = rp;
-
-            var p2pEndPoint = remote;
-            if (p2pEndPoint != null && reportedPort != null)
-                p2pEndPoint = new IPEndPoint(p2pEndPoint.Address, reportedPort.Value);
-
-            lock (lockObj)
-            {
-                if (clients.TryGetValue(clientId, out var existing))
-                {
-                    existing.P2PEndPoint = p2pEndPoint;
-                    existing.LastActive = DateTime.UtcNow;
-                }
-                else
-                {
-                    clients[clientId] = new ClientSession
-                    {
-                        ClientId = clientId,
-                        P2PEndPoint = p2pEndPoint,
-                        LastActive = DateTime.UtcNow
-                    };
-                }
-            }
-            var okLine = p2pEndPoint != null
-                ? $"{ServerCommands.Ok} {p2pEndPoint.Address} {p2pEndPoint.Port}"
-                : ServerCommands.Ok;
-            await writer.WriteLineAsync(okLine);
-            Console.WriteLine($"[Server] PORT_MAP {clientId} -> {p2pEndPoint}");
-            return;
-        }
 
         if (cmd == ServerCommands.Register)
         {
@@ -255,39 +297,20 @@ static async Task HandleClientAsync(TcpClient tcp, Dictionary<string, ClientSess
                         await writer.WriteLineAsync($"{ServerCommands.Err} id_mismatch");
                         continue;
                     }
-                    IPEndPoint? peerP2P = null;
-                    IPEndPoint? senderP2P = null;
-                    StreamWriter? peerWriter = null;
+                    bool peerOnline = false;
                     lock (lockObj)
                     {
                         if (clients.TryGetValue(clientId, out var s))
-                        {
                             s.LastActive = DateTime.UtcNow;
-                            senderP2P = s.P2PEndPoint;
-                        }
-                        if (clients.TryGetValue(peerId, out var peer))
-                        {
-                            peerP2P = peer.P2PEndPoint;
-                            peerWriter = peer.ControlWriter;
-                        }
+                        if (clients.TryGetValue(peerId, out var peer) && peer.ControlWriter != null)
+                            peerOnline = true;
                     }
-                    if (peerP2P == null || peerWriter == null)
+                    if (!peerOnline)
                     {
                         await writer.WriteLineAsync($"{ServerCommands.Err} peer_offline");
                         continue;
                     }
-                    if (senderP2P == null)
-                    {
-                        await writer.WriteLineAsync($"{ServerCommands.Err} no_p2p_port");
-                        continue;
-                    }
-                    await writer.WriteLineAsync($"{ServerCommands.P2P} {peerP2P.Address} {peerP2P.Port}");
-                    try
-                    {
-                        await peerWriter.WriteLineAsync($"{ServerCommands.Incoming} {clientId} {senderP2P.Address} {senderP2P.Port}");
-                        peerWriter.Flush();
-                    }
-                    catch { /* 对端可能已断开 */ }
+                    await writer.WriteLineAsync(ServerCommands.RelayOk);
                     continue;
                 }
             }
@@ -320,6 +343,5 @@ file class ClientSession
     public string ClientId { get; set; } = "";
     public StreamWriter? ControlWriter { get; set; }
     public IPEndPoint? ControlRemoteEndPoint { get; set; }
-    public IPEndPoint? P2PEndPoint { get; set; }
     public DateTime LastActive { get; set; }
 }

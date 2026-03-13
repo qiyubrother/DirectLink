@@ -23,13 +23,20 @@ public class P2PTransferService
         TransferFileLogger.Write("P2P-RECV", $"开始从流接收文件，saveDirectory='{saveDirectory}'");
         var lineBuffer = new List<byte>();
         var b = new byte[1];
-        while (await stream.ReadAsync(b, ct) == 1)
+        while (true)
         {
+            var read = await stream.ReadAsync(b, ct);
+            if (read == 0)
+            {
+                TransferFileLogger.Write("P2P-RECV", "读首行时流返回 0 字节（连接已关闭或无更多数据），lineBufferLen=" + lineBuffer.Count);
+                break;
+            }
+            if (read != 1) break;
             if (b[0] == (byte)'\n') break;
             lineBuffer.Add(b[0]);
         }
-        var metaLine = Encoding.UTF8.GetString(lineBuffer.ToArray()).TrimStart('\uFEFF'); // 去除可能的 BOM
-        TransferFileLogger.Write("P2P-RECV", $"META_LINE='{metaLine}'");
+        var metaLine = Encoding.UTF8.GetString(lineBuffer.ToArray()).TrimStart('\uFEFF');
+        TransferFileLogger.Write("P2P-RECV", $"META_LINE='{metaLine}' (len={metaLine.Length})");
         if (string.IsNullOrEmpty(metaLine) || !metaLine.StartsWith(P2PCommands.FileMeta, StringComparison.OrdinalIgnoreCase))
         {
             TransferFileLogger.Write("P2P-RECV", "首行不是 FILE_META，放弃本次接收。");
@@ -130,7 +137,12 @@ public class P2PTransferService
         fs.Close();
         if (totalReceived >= meta.FileSize)
         {
-            if (File.Exists(targetPath)) File.Delete(targetPath);
+            if (File.Exists(targetPath))
+            {
+                var existingLen = new FileInfo(targetPath).Length;
+                TransferFileLogger.Write("P2P-RECV", $"目标已存在，将覆盖: Target='{targetPath}', ExistingLength={existingLen}");
+                File.Delete(targetPath);
+            }
             File.Move(tmpPath, targetPath);
             try { File.Delete(metaPath); } catch { }
         }
@@ -140,9 +152,18 @@ public class P2PTransferService
         {
             var computed = HashUtil.ComputeSha256Sync(targetPath);
             hashOk = string.Equals(computed, meta.FileHash, StringComparison.OrdinalIgnoreCase);
+            if (!hashOk)
+                TransferFileLogger.Write("P2P-RECV", $"哈希校验失败: Target='{targetPath}', Expected='{meta.FileHash}', Actual='{computed}'");
         }
         else if (totalReceived == meta.FileSize)
             hashOk = true;
+
+        if (File.Exists(totalReceived == meta.FileSize ? targetPath : tmpPath))
+        {
+            var finalPath = totalReceived == meta.FileSize ? targetPath : tmpPath;
+            var finalLen = new FileInfo(finalPath).Length;
+            TransferFileLogger.Write("P2P-RECV", $"最终磁盘文件: Path='{finalPath}', Length={finalLen}");
+        }
 
         progress?.Report(new TransferProgress(meta.FileSize, meta.FileSize, 0));
         TransferFileLogger.Write("P2P-RECV", $"接收结束: SavedPath='{(totalReceived == meta.FileSize ? targetPath : null)}', Bytes={totalReceived}, HashOk={hashOk}");
@@ -190,9 +211,9 @@ public class P2PTransferService
         var metaLine = P2PCommands.FileMeta + " " + json + "\n";
         TransferFileLogger.Write("P2P-SEND", $"准备发送文件: Path='{filePath}', Size={fileSize}, ResumeOffset={resumeOffset}");
         TransferFileLogger.Write("P2P-SEND", $"META_LINE='{metaLine.TrimEnd()}'");
-        await using var writer = new StreamWriter(stream, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
-        await writer.WriteAsync(metaLine);
-        await writer.FlushAsync(ct);
+        // 用原始字节写 FILE_META，避免同一流上多个 StreamWriter 导致缓冲顺序错乱
+        var metaBytes = Encoding.UTF8.GetBytes(metaLine);
+        await stream.WriteAsync(metaBytes, ct);
 
         await using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read);
         fs.Seek(resumeOffset, SeekOrigin.Begin);

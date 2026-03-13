@@ -8,6 +8,6 @@ public static class P2PCommands
     /// <summary>文件传输元数据（JSON 行）：FILE_META {"FileName","FileSize","FileHash","ResumeOffset"}</summary>
     public const string FileMeta = "FILE_META";
 
-    /// <summary>后续为二进制块，无文本命令</summary>
-    public const int DefaultBlockSize = 64 * 1024;
+    /// <summary>后续为二进制块，无文本命令。小块传输利于弱网与进度反馈。</summary>
+    public const int DefaultBlockSize = 16 * 1024;
 }
